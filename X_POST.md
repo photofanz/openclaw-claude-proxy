@@ -1,12 +1,12 @@
 Opus 4.6 API 一個月燒幾千美金。
 
-我花 $215 搞了一個 24/7 的 Telegram AI 助手，大腦是 Opus 4.6，能聊天、能讀寫檔案、能跑 shell、能操作瀏覽器。
+我花 $200 搞了一個 24/7 的 Telegram AI 助手，大腦是 Opus 4.6，能聊天、能讀寫檔案、能跑 shell、能操作瀏覽器。
 
 做法很簡單：
 
 Claude Max 訂閱 $200/月，透過 Claude Code CLI 的 --print 模式驅動。中間寫了一層 Node.js Proxy 把 CLI 輸出包成 OpenAI 相容格式，接上 OpenClaw 這個 Agent 框架，再串 Telegram Bot。
 
-全部跑在一台便宜的 VPS 上（我用 $15/月的 AWS EC2）。
+全部跑在一台 VPS 上（我用 AWS Free Tier，免費）。
 
 架構：
 Telegram → OpenClaw Gateway → Proxy → claude --print → Anthropic API
@@ -33,7 +33,7 @@ bash setup.sh
 
 原始碼和腳本都在 GitHub。
 
-$215/月，你自己的 Opus 4.6 隨身顧問。
+$200/月，你自己的 Opus 4.6 隨身顧問。
 
 ---
 

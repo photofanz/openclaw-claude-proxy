@@ -36,7 +36,7 @@ claude --print (官方 CLI Binary)
 Anthropic API (Max 訂閱)
 ```
 
-全部跑在一台 AWS EC2 t3.small 上。月費：$200 (Max) + $15 (EC2) = **$215 Opus 4.6 隨便用。**
+全部跑在一台 AWS EC2 Free Tier 上。月費：**$200（就是 Claude Max 訂閱費）。**
 
 ---
 
