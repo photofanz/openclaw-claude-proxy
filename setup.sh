@@ -9,7 +9,7 @@
 #   3. 已 SSH 進入這台機器（或直接在 terminal 操作）
 #
 # 用法：
-#   curl -fsSL https://raw.githubusercontent.com/happycooper406-collab51/openclaw-claude-proxy/main/setup.sh -o setup.sh
+#   curl -fsSL https://raw.githubusercontent.com/51AutoPilot/openclaw-claude-proxy/main/setup.sh -o setup.sh
 #   bash setup.sh
 # ============================================================================
 
