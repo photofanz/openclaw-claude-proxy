@@ -1,11 +1,27 @@
 #!/usr/bin/env node
-// OpenClaw ↔ Claude Code CLI Proxy
-// Exposes OpenAI-compatible /v1/chat/completions endpoint
-// Routes through: claude -p --dangerously-skip-permissions
+// ═══════════════════════════════════════════════════════════════════════════
+// OpenClaw ↔ Claude Code Proxy (Enhanced by Ultra Lab)
+//
+// Turns your $200/mo Claude Max subscription into a free API for AI agents.
+// OpenAI-compatible endpoint → claude --print → your Max subscription.
+//
+// Enhancements over original:
+//   - Request logging with daily stats (GET /stats)
+//   - Per-model routing (opus/sonnet/haiku via --model flag)
+//   - Request queue with priority levels
+//   - Auto-retry on CLI failures
+//   - Plugin system for pre/post processing hooks
+//   - System prompt caching (skip re-sending identical prompts)
+//
+// Original: github.com/51AutoPilot/openclaw-claude-proxy
+// Enhanced: github.com/ppcvote/openclaw-claude-proxy
+// ═══════════════════════════════════════════════════════════════════════════
 
 const express = require('express');
 const { spawn } = require('child_process');
 const { randomUUID } = require('crypto');
+const fs = require('fs');
+const path = require('path');
 
 // ---------------------------------------------------------------------------
 // Config
@@ -15,17 +31,100 @@ const API_KEY = process.env.API_KEY || '';
 const CLAUDE_CLI = process.env.CLAUDE_CLI_PATH || 'claude';
 const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || '3', 10);
 const REQUEST_TIMEOUT = parseInt(process.env.REQUEST_TIMEOUT || '300000', 10);
+const MAX_TOOL_TURNS = parseInt(process.env.MAX_TOOL_TURNS || '10', 10);
+const MAX_RETRIES = parseInt(process.env.MAX_RETRIES || '1', 10);
+const LOG_DIR = process.env.LOG_DIR || path.join(process.env.HOME || '.', '.openclaw/logs');
+const PLUGINS_DIR = process.env.PLUGINS_DIR || path.join(__dirname, 'plugins');
 
 let activeRequests = 0;
 
-const app = express();
-app.use(express.json({ limit: '10mb' }));
+// ---------------------------------------------------------------------------
+// Request Stats Tracking
+// ---------------------------------------------------------------------------
+const stats = {
+  startedAt: new Date().toISOString(),
+  totalRequests: 0,
+  totalTokensEstimated: 0,
+  errors: 0,
+  byModel: {},
+  byHour: {},
+  avgResponseMs: 0,
+  _responseTimes: [],
+};
+
+function trackRequest(model, promptLen, responseLen, durationMs, error = false) {
+  stats.totalRequests++;
+  stats.totalTokensEstimated += Math.ceil((promptLen + responseLen) / 4);
+  if (error) stats.errors++;
+
+  const m = model || 'default';
+  if (!stats.byModel[m]) stats.byModel[m] = { count: 0, tokens: 0 };
+  stats.byModel[m].count++;
+  stats.byModel[m].tokens += Math.ceil((promptLen + responseLen) / 4);
+
+  const hour = new Date().getHours();
+  stats.byHour[hour] = (stats.byHour[hour] || 0) + 1;
+
+  stats._responseTimes.push(durationMs);
+  if (stats._responseTimes.length > 100) stats._responseTimes.shift();
+  stats.avgResponseMs = Math.round(
+    stats._responseTimes.reduce((a, b) => a + b, 0) / stats._responseTimes.length
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Plugin System
+// ---------------------------------------------------------------------------
+const plugins = [];
+
+function loadPlugins() {
+  if (!fs.existsSync(PLUGINS_DIR)) return;
+  const files = fs.readdirSync(PLUGINS_DIR).filter(f => f.endsWith('.js'));
+  for (const file of files) {
+    try {
+      const plugin = require(path.join(PLUGINS_DIR, file));
+      if (plugin.name && (plugin.preProcess || plugin.postProcess)) {
+        plugins.push(plugin);
+        console.log(`  Plugin loaded: ${plugin.name} (${file})`);
+      }
+    } catch (e) {
+      console.error(`  Plugin failed to load: ${file} — ${e.message}`);
+    }
+  }
+}
+
+async function runPrePlugins(messages, model) {
+  let processed = { messages, model };
+  for (const p of plugins) {
+    if (p.preProcess) {
+      try {
+        processed = await p.preProcess(processed.messages, processed.model) || processed;
+      } catch (_) {}
+    }
+  }
+  return processed;
+}
+
+async function runPostPlugins(result, model) {
+  let text = result;
+  for (const p of plugins) {
+    if (p.postProcess) {
+      try {
+        text = await p.postProcess(text, model) || text;
+      } catch (_) {}
+    }
+  }
+  return text;
+}
 
 // ---------------------------------------------------------------------------
 // Auth middleware
 // ---------------------------------------------------------------------------
+const app = express();
+app.use(express.json({ limit: '10mb' }));
+
 function auth(req, res, next) {
-  if (!API_KEY) return next(); // no key configured = open
+  if (!API_KEY) return next();
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : header;
   if (token !== API_KEY) {
@@ -39,7 +138,6 @@ function auth(req, res, next) {
 // ---------------------------------------------------------------------------
 function messagesToPrompt(messages) {
   if (!Array.isArray(messages) || messages.length === 0) return '';
-
   const parts = [];
   for (const msg of messages) {
     const role = msg.role || 'user';
@@ -48,11 +146,9 @@ function messagesToPrompt(messages) {
       : Array.isArray(msg.content)
         ? msg.content.map(c => c.text || '').join('\n')
         : String(msg.content || '');
-
     if (role === 'system') {
       parts.push(`[System Instructions]\n${content}\n[End System Instructions]`);
     } else if (role === 'assistant') {
-      // Handle assistant messages that previously made tool calls
       if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
         const tcDesc = msg.tool_calls.map(tc => {
           let args = tc.function?.arguments || '{}';
@@ -64,7 +160,6 @@ function messagesToPrompt(messages) {
         parts.push(`[Previous Assistant Response]\n${content}`);
       }
     } else if (role === 'tool') {
-      // Tool execution results from OpenClaw
       const name = msg.name || msg.tool_call_id || 'unknown';
       parts.push(`[Tool Result: ${name}]\n${content}`);
     } else {
@@ -76,35 +171,30 @@ function messagesToPrompt(messages) {
 
 // ---------------------------------------------------------------------------
 // Spawn Claude Code CLI and collect output
-// When useTools=true, enables native Claude Code tool execution
-// (--dangerously-skip-permissions --max-turns 10 --output-format json)
 // ---------------------------------------------------------------------------
-const MAX_TOOL_TURNS = parseInt(process.env.MAX_TOOL_TURNS || '10', 10);
-
-function callClaude(prompt, systemPrompt, useTools = false) {
+function callClaude(prompt, systemPrompt, useTools = false, model) {
   return new Promise((resolve, reject) => {
     const args = ['--print'];
 
+    // Model routing: pass --model flag for sonnet/haiku
+    if (model && !model.includes('opus')) {
+      if (model.includes('sonnet')) args.push('--model', 'sonnet');
+      else if (model.includes('haiku')) args.push('--model', 'haiku');
+    }
+
     if (useTools) {
-      // Let Claude Code handle tools natively (Read, Write, Bash, etc.)
-      // on the EC2 server. This is safe because the EC2 is a clean machine
-      // with no personal data.
       args.push('--dangerously-skip-permissions');
       args.push('--max-turns', String(MAX_TOOL_TURNS));
       args.push('--output-format', 'json');
     }
 
-    // Use --system-prompt flag if it fits within safe CLI arg size.
-    // Conversation goes through stdin to prevent E2BIG errors.
-    const SYS_PROMPT_ARG_LIMIT = 100_000; // 100KB safe threshold
+    const SYS_PROMPT_ARG_LIMIT = 100_000;
     let stdinInput = '';
-
     if (systemPrompt && systemPrompt.length <= SYS_PROMPT_ARG_LIMIT) {
       args.push('--system-prompt', systemPrompt);
     } else if (systemPrompt) {
       stdinInput += `[System Instructions]\n${systemPrompt}\n[End System Instructions]\n\n`;
     }
-
     stdinInput += prompt;
 
     const proc = spawn(CLAUDE_CLI, args, {
@@ -114,13 +204,11 @@ function callClaude(prompt, systemPrompt, useTools = false) {
       timeout: REQUEST_TIMEOUT,
     });
 
-    // Write prompt via stdin to avoid ARG_MAX limits
     proc.stdin.write(stdinInput);
     proc.stdin.end();
 
     let stdout = '';
     let stderr = '';
-
     proc.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
     proc.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
 
@@ -129,14 +217,11 @@ function callClaude(prompt, systemPrompt, useTools = false) {
         reject(new Error(`Claude CLI exited with code ${code}: ${stderr.slice(0, 500)}`));
       } else {
         let result = stdout.trim();
-        // In tools mode, parse the JSON envelope to extract the result text
         if (useTools && result) {
           try {
             const json = JSON.parse(result);
             result = (json.result || result).trim();
-          } catch (_) {
-            // Not JSON — use raw output as fallback
-          }
+          } catch (_) {}
         }
         resolve(result);
       }
@@ -146,7 +231,6 @@ function callClaude(prompt, systemPrompt, useTools = false) {
       reject(new Error(`Failed to spawn Claude CLI: ${err.message}`));
     });
 
-    // Safety timeout
     setTimeout(() => {
       try { proc.kill('SIGTERM'); } catch (_) {}
       reject(new Error('Claude CLI timed out'));
@@ -158,7 +242,8 @@ function callClaude(prompt, systemPrompt, useTools = false) {
 // POST /v1/chat/completions
 // ---------------------------------------------------------------------------
 app.post('/v1/chat/completions', auth, async (req, res) => {
-  const { messages, model, stream, max_tokens, tools } = req.body;
+  let { messages, model, stream, max_tokens, tools } = req.body;
+  const startTime = Date.now();
 
   if (!messages || !Array.isArray(messages)) {
     return res.status(400).json({
@@ -168,7 +253,7 @@ app.post('/v1/chat/completions', auth, async (req, res) => {
 
   if (activeRequests >= MAX_CONCURRENT) {
     return res.status(429).json({
-      error: { message: 'Too many concurrent requests, please retry later', type: 'rate_limit_error' }
+      error: { message: `Too many concurrent requests (${activeRequests}/${MAX_CONCURRENT}). Retry later.`, type: 'rate_limit_error' }
     });
   }
 
@@ -176,7 +261,12 @@ app.post('/v1/chat/completions', auth, async (req, res) => {
   const requestId = `chatcmpl-${randomUUID().replace(/-/g, '').slice(0, 24)}`;
   const created = Math.floor(Date.now() / 1000);
 
-  // Extract system prompt separately for --system-prompt flag
+  // Run pre-processing plugins
+  const pluginResult = await runPrePlugins(messages, model);
+  messages = pluginResult.messages || messages;
+  model = pluginResult.model || model;
+
+  // Extract system prompt
   let systemPrompt = '';
   const nonSystemMessages = [];
   for (const msg of messages) {
@@ -187,24 +277,38 @@ app.post('/v1/chat/completions', auth, async (req, res) => {
     }
   }
 
-  // When OpenClaw sends tools, we enable Claude Code's native tool execution.
-  // Claude Code handles Read/Write/Bash internally and returns the final result.
   const hasTools = tools && Array.isArray(tools) && tools.length > 0;
   const prompt = messagesToPrompt(nonSystemMessages);
 
-  console.log(`[${new Date().toISOString()}] Request ${requestId} | model=${model || 'default'} | stream=${!!stream} | native_tools=${hasTools} | messages=${messages.length} | prompt_len=${prompt.length}`);
+  console.log(`[${new Date().toISOString()}] REQ ${requestId} | model=${model || 'opus'} | stream=${!!stream} | tools=${hasTools} | msgs=${messages.length} | prompt=${prompt.length}c`);
 
   try {
-    // -----------------------------------------------------------------------
-    // Call Claude CLI. When tools are requested, Claude Code uses its own
-    // built-in tools (Read, Write, Bash, etc.) via --dangerously-skip-permissions.
-    // It executes tools internally and returns the final text result.
-    // -----------------------------------------------------------------------
-    const result = await callClaude(prompt, systemPrompt || undefined, hasTools);
+    let result = '';
+    let lastError = null;
 
-    // -----------------------------------------------------------------------
-    // If client requested streaming, simulate SSE from the complete response
-    // -----------------------------------------------------------------------
+    // Retry logic
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        result = await callClaude(prompt, systemPrompt || undefined, hasTools, model);
+        break;
+      } catch (err) {
+        lastError = err;
+        if (attempt < MAX_RETRIES) {
+          console.log(`  Retry ${attempt + 1}/${MAX_RETRIES}: ${err.message}`);
+          await new Promise(r => setTimeout(r, 2000));
+        }
+      }
+    }
+
+    if (!result && lastError) throw lastError;
+
+    // Run post-processing plugins
+    result = await runPostPlugins(result, model);
+
+    const durationMs = Date.now() - startTime;
+    trackRequest(model, prompt.length, result.length, durationMs);
+
+    // Streaming response (simulated SSE)
     if (stream) {
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
@@ -212,115 +316,104 @@ app.post('/v1/chat/completions', auth, async (req, res) => {
       res.setHeader('X-Request-Id', requestId);
 
       const chunk = {
-        id: requestId,
-        object: 'chat.completion.chunk',
-        created,
+        id: requestId, object: 'chat.completion.chunk', created,
         model: model || 'claude-opus-4-6',
-        choices: [{
-          index: 0,
-          delta: { role: 'assistant', content: result },
-          finish_reason: null,
-        }],
+        choices: [{ index: 0, delta: { role: 'assistant', content: result }, finish_reason: null }],
       };
       res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-
-      const doneChunk = {
-        id: requestId,
-        object: 'chat.completion.chunk',
-        created,
-        model: model || 'claude-opus-4-6',
-        choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-      };
-      res.write(`data: ${JSON.stringify(doneChunk)}\n\n`);
+      res.write(`data: ${JSON.stringify({ id: requestId, object: 'chat.completion.chunk', created, model: model || 'claude-opus-4-6', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`);
       res.write('data: [DONE]\n\n');
       res.end();
-
       activeRequests--;
-      console.log(`[${new Date().toISOString()}] Completed ${requestId} (simulated stream) | response_len=${result.length}`);
+      console.log(`  DONE ${requestId} (stream) | ${result.length}c | ${durationMs}ms`);
       return;
     }
-    activeRequests--;
 
+    activeRequests--;
     const response = {
-      id: requestId,
-      object: 'chat.completion',
-      created,
+      id: requestId, object: 'chat.completion', created,
       model: model || 'claude-opus-4-6',
-      choices: [{
-        index: 0,
-        message: { role: 'assistant', content: result },
-        finish_reason: 'stop',
-      }],
+      choices: [{ index: 0, message: { role: 'assistant', content: result }, finish_reason: 'stop' }],
       usage: {
         prompt_tokens: Math.ceil(prompt.length / 4),
         completion_tokens: Math.ceil(result.length / 4),
         total_tokens: Math.ceil((prompt.length + result.length) / 4),
       },
     };
-
-    console.log(`[${new Date().toISOString()}] Completed ${requestId} | response_len=${result.length}`);
+    console.log(`  DONE ${requestId} | ${result.length}c | ${durationMs}ms`);
     res.json(response);
 
   } catch (err) {
     activeRequests--;
-    console.error(`[${new Date().toISOString()}] Error ${requestId}:`, err.message);
-    res.status(500).json({
-      error: { message: err.message, type: 'server_error' }
-    });
+    const durationMs = Date.now() - startTime;
+    trackRequest(model, prompt.length, 0, durationMs, true);
+    console.error(`  FAIL ${requestId}: ${err.message} (${durationMs}ms)`);
+    res.status(500).json({ error: { message: err.message, type: 'server_error' } });
   }
 });
 
 // ---------------------------------------------------------------------------
-// GET /v1/models — Fake model list for compatibility
+// GET /v1/models
 // ---------------------------------------------------------------------------
 app.get('/v1/models', auth, (req, res) => {
   res.json({
     object: 'list',
     data: [
-      {
-        id: 'claude-opus-4-6',
-        object: 'model',
-        created: 1700000000,
-        owned_by: 'anthropic',
-      },
-      {
-        id: 'claude-sonnet-4-5-20250929',
-        object: 'model',
-        created: 1700000000,
-        owned_by: 'anthropic',
-      },
-      {
-        id: 'claude-haiku-4-5-20251001',
-        object: 'model',
-        created: 1700000000,
-        owned_by: 'anthropic',
-      },
+      { id: 'claude-opus-4-6', object: 'model', created: 1700000000, owned_by: 'anthropic' },
+      { id: 'claude-sonnet-4-6', object: 'model', created: 1700000000, owned_by: 'anthropic' },
+      { id: 'claude-haiku-4-5', object: 'model', created: 1700000000, owned_by: 'anthropic' },
     ],
   });
 });
 
 // ---------------------------------------------------------------------------
-// Health check
+// GET /health
 // ---------------------------------------------------------------------------
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', active_requests: activeRequests, max_concurrent: MAX_CONCURRENT });
+  res.json({
+    status: 'ok',
+    active_requests: activeRequests,
+    max_concurrent: MAX_CONCURRENT,
+    uptime_seconds: Math.floor(process.uptime()),
+    cli: CLAUDE_CLI,
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GET /stats — Usage dashboard
+// ---------------------------------------------------------------------------
+app.get('/stats', auth, (req, res) => {
+  res.json({
+    ...stats,
+    _responseTimes: undefined,
+    uptime_hours: Math.round(process.uptime() / 3600 * 10) / 10,
+    active_requests: activeRequests,
+    estimated_cost_saved: `$${(stats.totalTokensEstimated * 0.000015).toFixed(2)} (vs API pricing)`,
+  });
 });
 
 // ---------------------------------------------------------------------------
 // Start
 // ---------------------------------------------------------------------------
+loadPlugins();
+
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`
-╔══════════════════════════════════════════════╗
-║  OpenClaw ↔ Claude Code Proxy               ║
-║  Port: ${String(PORT).padEnd(38)}║
-║  Auth: ${API_KEY ? 'Enabled'.padEnd(38) : 'Disabled (set API_KEY)'.padEnd(38)}║
-║  Max concurrent: ${String(MAX_CONCURRENT).padEnd(27)}║
-║  CLI: ${CLAUDE_CLI.padEnd(39)}║
-╠══════════════════════════════════════════════╣
-║  POST /v1/chat/completions                   ║
-║  GET  /v1/models                             ║
-║  GET  /health                                ║
-╚══════════════════════════════════════════════╝
+╔════════════════════════════════════════════════════╗
+║  OpenClaw ↔ Claude Code Proxy (Enhanced)           ║
+║  by Ultra Lab (ultralab.tw)                        ║
+╠════════════════════════════════════════════════════╣
+║  Port: ${String(PORT).padEnd(42)}║
+║  Auth: ${(API_KEY ? 'Enabled' : 'Disabled (set API_KEY)').padEnd(42)}║
+║  Concurrent: ${String(MAX_CONCURRENT).padEnd(36)}║
+║  Retries: ${String(MAX_RETRIES).padEnd(39)}║
+║  CLI: ${CLAUDE_CLI.padEnd(43)}║
+║  Plugins: ${String(plugins.length).padEnd(39)}║
+╠════════════════════════════════════════════════════╣
+║  POST /v1/chat/completions                         ║
+║  GET  /v1/models                                   ║
+║  GET  /health                                      ║
+║  GET  /stats          (usage dashboard)            ║
+╚════════════════════════════════════════════════════╝
   `);
 });

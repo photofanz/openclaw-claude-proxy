@@ -1,11 +1,18 @@
 {
   "name": "openclaw-claude-proxy",
-  "version": "1.0.0",
-  "description": "OpenAI-compatible proxy that routes requests through Claude Code CLI",
+  "version": "2.0.0",
+  "description": "Turn Claude Max ($200/mo) into a free OpenAI-compatible API for your AI agent fleet. Plugin system, multi-model routing, usage stats.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js"
+  },
+  "keywords": ["claude", "proxy", "openai", "openclaw", "ai-agent", "llm", "claude-max"],
+  "author": "Ultra Lab (ultralab.tw)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ppcvote/openclaw-claude-proxy"
   },
   "dependencies": {
     "express": "^4.21.0",
