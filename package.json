@@ -1,13 +1,21 @@
 {
   "name": "openclaw-claude-proxy",
-  "version": "2.0.0",
-  "description": "Turn Claude Max ($200/mo) into a free OpenAI-compatible API for your AI agent fleet. Plugin system, multi-model routing, usage stats.",
+  "version": "3.0.0",
+  "description": "OpenClaw Claude Code Proxy v3 \u2014 Anthropic Messages API via Agent SDK + OpenAI-compatible legacy endpoint",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js"
   },
-  "keywords": ["claude", "proxy", "openai", "openclaw", "ai-agent", "llm", "claude-max"],
+  "keywords": [
+    "claude",
+    "proxy",
+    "openai",
+    "openclaw",
+    "ai-agent",
+    "llm",
+    "claude-max"
+  ],
   "author": "Ultra Lab (ultralab.tw)",
   "license": "MIT",
   "repository": {
@@ -15,6 +23,7 @@
     "url": "https://github.com/ppcvote/openclaw-claude-proxy"
   },
   "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.87",
     "express": "^4.21.0",
     "uuid": "^11.0.0"
   }

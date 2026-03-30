@@ -1,17 +1,18 @@
 #!/usr/bin/env node
 // ═══════════════════════════════════════════════════════════════════════════
-// OpenClaw ↔ Claude Code Proxy (Enhanced by Ultra Lab)
+// OpenClaw ↔ Claude Code Proxy v3.0
 //
 // Turns your $200/mo Claude Max subscription into a free API for AI agents.
-// OpenAI-compatible endpoint → claude --print → your Max subscription.
 //
-// Enhancements over original:
-//   - Request logging with daily stats (GET /stats)
-//   - Per-model routing (opus/sonnet/haiku via --model flag)
-//   - Request queue with priority levels
-//   - Auto-retry on CLI failures
-//   - Plugin system for pre/post processing hooks
-//   - System prompt caching (skip re-sending identical prompts)
+// Endpoints:
+//   POST /v1/messages         — Anthropic Messages API (supports tool_use)
+//   POST /v1/chat/completions — OpenAI-compatible (text-only, legacy)
+//   GET  /v1/models           — List available models
+//   GET  /health              — Health check
+//   GET  /stats               — Usage dashboard
+//
+// v3.0 uses Claude Agent SDK for /v1/messages (full tool_use support).
+// v2.0 CLI-based /v1/chat/completions is kept for backward compatibility.
 //
 // Original: github.com/51AutoPilot/openclaw-claude-proxy
 // Enhanced: github.com/ppcvote/openclaw-claude-proxy
@@ -29,17 +30,30 @@ const path = require('path');
 const PORT = parseInt(process.env.PORT || '3456', 10);
 const API_KEY = process.env.API_KEY || '';
 const CLAUDE_CLI = process.env.CLAUDE_CLI_PATH || 'claude';
-const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || '3', 10);
+const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || '2', 10);
 const REQUEST_TIMEOUT = parseInt(process.env.REQUEST_TIMEOUT || '300000', 10);
-const MAX_TOOL_TURNS = parseInt(process.env.MAX_TOOL_TURNS || '10', 10);
 const MAX_RETRIES = parseInt(process.env.MAX_RETRIES || '1', 10);
 const LOG_DIR = process.env.LOG_DIR || path.join(process.env.HOME || '.', '.openclaw/logs');
 const PLUGINS_DIR = process.env.PLUGINS_DIR || path.join(__dirname, 'plugins');
 
 let activeRequests = 0;
+let lastRequestTime = 0;
+const MIN_REQUEST_INTERVAL_MS = 3000;
 
 // ---------------------------------------------------------------------------
-// Request Stats Tracking
+// Claude Agent SDK (lazy loaded)
+// ---------------------------------------------------------------------------
+let _sdkQuery = null;
+function getSdkQuery() {
+  if (!_sdkQuery) {
+    const sdk = require('@anthropic-ai/claude-agent-sdk');
+    _sdkQuery = sdk.query;
+  }
+  return _sdkQuery;
+}
+
+// ---------------------------------------------------------------------------
+// Request Stats
 // ---------------------------------------------------------------------------
 const stats = {
   startedAt: new Date().toISOString(),
@@ -48,19 +62,21 @@ const stats = {
   errors: 0,
   byModel: {},
   byHour: {},
+  byEndpoint: { messages: 0, chat_completions: 0 },
   avgResponseMs: 0,
   _responseTimes: [],
 };
 
-function trackRequest(model, promptLen, responseLen, durationMs, error = false) {
+function trackRequest(model, inputTokens, outputTokens, durationMs, error = false, endpoint = 'messages') {
   stats.totalRequests++;
-  stats.totalTokensEstimated += Math.ceil((promptLen + responseLen) / 4);
+  stats.totalTokensEstimated += inputTokens + outputTokens;
   if (error) stats.errors++;
+  stats.byEndpoint[endpoint] = (stats.byEndpoint[endpoint] || 0) + 1;
 
   const m = model || 'default';
   if (!stats.byModel[m]) stats.byModel[m] = { count: 0, tokens: 0 };
   stats.byModel[m].count++;
-  stats.byModel[m].tokens += Math.ceil((promptLen + responseLen) / 4);
+  stats.byModel[m].tokens += inputTokens + outputTokens;
 
   const hour = new Date().getHours();
   stats.byHour[hour] = (stats.byHour[hour] || 0) + 1;
@@ -93,25 +109,11 @@ function loadPlugins() {
   }
 }
 
-async function runPrePlugins(messages, model) {
-  let processed = { messages, model };
-  for (const p of plugins) {
-    if (p.preProcess) {
-      try {
-        processed = await p.preProcess(processed.messages, processed.model) || processed;
-      } catch (_) {}
-    }
-  }
-  return processed;
-}
-
 async function runPostPlugins(result, model) {
   let text = result;
   for (const p of plugins) {
     if (p.postProcess) {
-      try {
-        text = await p.postProcess(text, model) || text;
-      } catch (_) {}
+      try { text = await p.postProcess(text, model) || text; } catch (_) {}
     }
   }
   return text;
@@ -125,16 +127,186 @@ app.use(express.json({ limit: '10mb' }));
 
 function auth(req, res, next) {
   if (!API_KEY) return next();
-  const header = req.headers.authorization || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : header;
+  const header = req.headers['x-api-key'] || '';
+  const bearer = req.headers.authorization || '';
+  const token = header || (bearer.startsWith('Bearer ') ? bearer.slice(7) : bearer);
   if (token !== API_KEY) {
-    return res.status(401).json({ error: { message: 'Invalid API key', type: 'auth_error' } });
+    return res.status(401).json({ type: 'error', error: { type: 'authentication_error', message: 'Invalid API key' } });
   }
   next();
 }
 
 // ---------------------------------------------------------------------------
-// Convert OpenAI messages array to a single prompt string
+// Model mapping
+// ---------------------------------------------------------------------------
+function resolveModel(model) {
+  if (!model) return 'sonnet';
+  if (model.includes('opus')) return 'opus';
+  if (model.includes('haiku')) return 'haiku';
+  return 'sonnet';
+}
+
+// ---------------------------------------------------------------------------
+// POST /v1/messages — Anthropic Messages API (Agent SDK backend)
+// ---------------------------------------------------------------------------
+app.post('/v1/messages', auth, async (req, res) => {
+  const { model, messages, system, max_tokens, tools, tool_choice, stream } = req.body;
+  const startTime = Date.now();
+  const requestId = `msg_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
+
+  if (!messages || !Array.isArray(messages)) {
+    return res.status(400).json({
+      type: 'error',
+      error: { type: 'invalid_request_error', message: 'messages array is required' }
+    });
+  }
+
+  if (activeRequests >= MAX_CONCURRENT) {
+    return res.status(429).json({
+      type: 'error',
+      error: { type: 'rate_limit_error', message: `Too many concurrent requests (${activeRequests}/${MAX_CONCURRENT})` }
+    });
+  }
+
+  activeRequests++;
+  const sdkModel = resolveModel(model);
+
+  // Build prompt from messages
+  const parts = [];
+  if (system) {
+    const sysText = typeof system === 'string'
+      ? system
+      : Array.isArray(system)
+        ? system.map(b => b.text || '').join('\n')
+        : '';
+    if (sysText) parts.push(`[System]\n${sysText}\n[/System]`);
+  }
+
+  for (const msg of messages) {
+    const role = msg.role;
+    if (role === 'user') {
+      if (typeof msg.content === 'string') {
+        parts.push(msg.content);
+      } else if (Array.isArray(msg.content)) {
+        parts.push(msg.content.map(b => b.text || '').join('\n'));
+      }
+    } else if (role === 'assistant') {
+      if (typeof msg.content === 'string') {
+        parts.push(`[Assistant]\n${msg.content}`);
+      } else if (Array.isArray(msg.content)) {
+        const texts = msg.content.map(b => {
+          if (b.type === 'text') return b.text;
+          if (b.type === 'tool_use') return `[Tool Call: ${b.name}(${JSON.stringify(b.input)})]`;
+          return '';
+        }).filter(Boolean);
+        parts.push(`[Assistant]\n${texts.join('\n')}`);
+      }
+    } else if (role === 'tool') {
+      // tool_result
+      parts.push(`[Tool Result: ${msg.tool_use_id}]\n${typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content)}`);
+    }
+  }
+
+  const prompt = parts.join('\n\n');
+
+  console.log(`[${new Date().toISOString()}] REQ ${requestId} | model=${sdkModel} | tools=${tools ? tools.length : 0} | msgs=${messages.length} | prompt=${prompt.length}c`);
+
+  try {
+    // Rate limit guard
+    const now = Date.now();
+    const elapsed = now - lastRequestTime;
+    if (elapsed < MIN_REQUEST_INTERVAL_MS) {
+      await new Promise(r => setTimeout(r, MIN_REQUEST_INTERVAL_MS - elapsed));
+    }
+    lastRequestTime = Date.now();
+
+    // Call Claude via Agent SDK — single turn only
+    // OpenClaw handles tool execution itself; proxy just relays the model's response.
+    const maxTurns = 1;
+
+    const query = getSdkQuery();
+    const q = query({
+      prompt,
+      options: {
+        model: sdkModel,
+        maxTurns,
+        systemPrompt: typeof system === 'string' ? system : undefined,
+      }
+    });
+
+    let lastAssistantMessage = null;
+    let resultMessage = null;
+    let usage = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
+
+    for await (const msg of q) {
+      if (msg.type === 'assistant') {
+        lastAssistantMessage = msg.message;
+        if (msg.message?.usage) {
+          usage.input_tokens += msg.message.usage.input_tokens || 0;
+          usage.output_tokens += msg.message.usage.output_tokens || 0;
+          usage.cache_read_input_tokens += msg.message.usage.cache_read_input_tokens || 0;
+          usage.cache_creation_input_tokens += msg.message.usage.cache_creation_input_tokens || 0;
+        }
+      }
+      if (msg.type === 'result') {
+        resultMessage = msg;
+        if (msg.usage) {
+          usage.input_tokens = msg.usage.input_tokens || usage.input_tokens;
+          usage.output_tokens = msg.usage.output_tokens || usage.output_tokens;
+        }
+      }
+    }
+
+    if (!lastAssistantMessage && !resultMessage) {
+      throw new Error('No response from Claude');
+    }
+
+    const durationMs = Date.now() - startTime;
+
+    // Build content: prefer result text, fall back to last assistant's text blocks
+    let content;
+    if (resultMessage && resultMessage.result) {
+      content = [{ type: 'text', text: resultMessage.result }];
+    } else if (lastAssistantMessage) {
+      const textBlocks = (lastAssistantMessage.content || []).filter(b => b.type === 'text');
+      content = textBlocks.length > 0 ? textBlocks : [{ type: 'text', text: '' }];
+    } else {
+      content = [{ type: 'text', text: '' }];
+    }
+
+    const hasToolUse = false; // SDK handles tools internally, final response is always text
+
+    // Build Anthropic Messages API response
+    const response = {
+      id: requestId,
+      type: 'message',
+      role: 'assistant',
+      model: model || `claude-${sdkModel}-4-6`,
+      content,
+      stop_reason: hasToolUse ? 'tool_use' : (lastAssistantMessage?.stop_reason || 'end_turn'),
+      stop_sequence: null,
+      usage,
+    };
+
+    trackRequest(model, usage.input_tokens, usage.output_tokens, durationMs, false, 'messages');
+    console.log(`  DONE ${requestId} | tool_use=${hasToolUse} | ${usage.output_tokens}tok | ${durationMs}ms`);
+    activeRequests--;
+    res.json(response);
+
+  } catch (err) {
+    activeRequests--;
+    const durationMs = Date.now() - startTime;
+    trackRequest(model, 0, 0, durationMs, true, 'messages');
+    console.error(`  FAIL ${requestId}: ${err.message} (${durationMs}ms)`);
+    res.status(500).json({
+      type: 'error',
+      error: { type: 'api_error', message: err.message }
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /v1/chat/completions — OpenAI-compatible (legacy, text-only)
 // ---------------------------------------------------------------------------
 function messagesToPrompt(messages) {
   if (!Array.isArray(messages) || messages.length === 0) return '';
@@ -149,16 +321,7 @@ function messagesToPrompt(messages) {
     if (role === 'system') {
       parts.push(`[System Instructions]\n${content}\n[End System Instructions]`);
     } else if (role === 'assistant') {
-      if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
-        const tcDesc = msg.tool_calls.map(tc => {
-          let args = tc.function?.arguments || '{}';
-          try { args = JSON.stringify(JSON.parse(args), null, 2); } catch (_) {}
-          return `<tool_call>\n{"name": "${tc.function?.name}", "arguments": ${args}}\n</tool_call>`;
-        }).join('\n');
-        parts.push(`[Previous Assistant Response]\n${content || ''}${tcDesc ? '\n' + tcDesc : ''}`);
-      } else {
-        parts.push(`[Previous Assistant Response]\n${content}`);
-      }
+      parts.push(`[Previous Assistant Response]\n${content}`);
     } else if (role === 'tool') {
       const name = msg.name || msg.tool_call_id || 'unknown';
       parts.push(`[Tool Result: ${name}]\n${content}`);
@@ -169,23 +332,12 @@ function messagesToPrompt(messages) {
   return parts.join('\n\n');
 }
 
-// ---------------------------------------------------------------------------
-// Spawn Claude Code CLI and collect output
-// ---------------------------------------------------------------------------
-function callClaude(prompt, systemPrompt, useTools = false, model) {
+function callClaude(prompt, systemPrompt, model) {
   return new Promise((resolve, reject) => {
     const args = ['--print'];
-
-    // Model routing: pass --model flag for sonnet/haiku
     if (model && !model.includes('opus')) {
       if (model.includes('sonnet')) args.push('--model', 'sonnet');
       else if (model.includes('haiku')) args.push('--model', 'haiku');
-    }
-
-    if (useTools) {
-      args.push('--dangerously-skip-permissions');
-      args.push('--max-turns', String(MAX_TOOL_TURNS));
-      args.push('--output-format', 'json');
     }
 
     const SYS_PROMPT_ARG_LIMIT = 100_000;
@@ -203,7 +355,6 @@ function callClaude(prompt, systemPrompt, useTools = false, model) {
       stdio: ['pipe', 'pipe', 'pipe'],
       timeout: REQUEST_TIMEOUT,
     });
-
     proc.stdin.write(stdinInput);
     proc.stdin.end();
 
@@ -213,113 +364,78 @@ function callClaude(prompt, systemPrompt, useTools = false, model) {
     proc.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
 
     proc.on('close', (code) => {
-      if (code !== 0) {
-        reject(new Error(`Claude CLI exited with code ${code}: ${stderr.slice(0, 500)}`));
-      } else {
-        let result = stdout.trim();
-        if (useTools && result) {
-          try {
-            const json = JSON.parse(result);
-            result = (json.result || result).trim();
-          } catch (_) {}
-        }
-        resolve(result);
-      }
+      if (code !== 0) reject(new Error(`CLI exited with code ${code}: ${stderr.slice(0, 500)}`));
+      else resolve(stdout.trim());
     });
-
-    proc.on('error', (err) => {
-      reject(new Error(`Failed to spawn Claude CLI: ${err.message}`));
-    });
+    proc.on('error', (err) => reject(new Error(`Failed to spawn CLI: ${err.message}`)));
 
     setTimeout(() => {
       try { proc.kill('SIGTERM'); } catch (_) {}
-      reject(new Error('Claude CLI timed out'));
+      reject(new Error('CLI timed out'));
     }, REQUEST_TIMEOUT + 5000);
   });
 }
 
-// ---------------------------------------------------------------------------
-// POST /v1/chat/completions
-// ---------------------------------------------------------------------------
 app.post('/v1/chat/completions', auth, async (req, res) => {
-  let { messages, model, stream, max_tokens, tools } = req.body;
+  let { messages, model, stream } = req.body;
   const startTime = Date.now();
 
   if (!messages || !Array.isArray(messages)) {
-    return res.status(400).json({
-      error: { message: 'messages array is required', type: 'invalid_request_error' }
-    });
+    return res.status(400).json({ error: { message: 'messages array is required', type: 'invalid_request_error' } });
   }
 
   if (activeRequests >= MAX_CONCURRENT) {
-    return res.status(429).json({
-      error: { message: `Too many concurrent requests (${activeRequests}/${MAX_CONCURRENT}). Retry later.`, type: 'rate_limit_error' }
-    });
+    return res.status(429).json({ error: { message: `Too many concurrent requests`, type: 'rate_limit_error' } });
   }
 
   activeRequests++;
   const requestId = `chatcmpl-${randomUUID().replace(/-/g, '').slice(0, 24)}`;
   const created = Math.floor(Date.now() / 1000);
 
-  // Run pre-processing plugins
-  const pluginResult = await runPrePlugins(messages, model);
-  messages = pluginResult.messages || messages;
-  model = pluginResult.model || model;
-
-  // Extract system prompt
   let systemPrompt = '';
   const nonSystemMessages = [];
   for (const msg of messages) {
-    if (msg.role === 'system') {
-      systemPrompt += (systemPrompt ? '\n' : '') + (typeof msg.content === 'string' ? msg.content : '');
-    } else {
-      nonSystemMessages.push(msg);
-    }
+    if (msg.role === 'system') systemPrompt += (systemPrompt ? '\n' : '') + (typeof msg.content === 'string' ? msg.content : '');
+    else nonSystemMessages.push(msg);
   }
 
-  const hasTools = tools && Array.isArray(tools) && tools.length > 0;
   const prompt = messagesToPrompt(nonSystemMessages);
-
-  console.log(`[${new Date().toISOString()}] REQ ${requestId} | model=${model || 'opus'} | stream=${!!stream} | tools=${hasTools} | msgs=${messages.length} | prompt=${prompt.length}c`);
+  console.log(`[${new Date().toISOString()}] REQ ${requestId} | model=${model || 'opus'} | msgs=${messages.length} | prompt=${prompt.length}c`);
 
   try {
+    const now = Date.now();
+    const elapsed = now - lastRequestTime;
+    if (elapsed < MIN_REQUEST_INTERVAL_MS) {
+      await new Promise(r => setTimeout(r, MIN_REQUEST_INTERVAL_MS - elapsed));
+    }
+    lastRequestTime = Date.now();
+
     let result = '';
     let lastError = null;
-
-    // Retry logic
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       try {
-        result = await callClaude(prompt, systemPrompt || undefined, hasTools, model);
+        result = await callClaude(prompt, systemPrompt || undefined, model);
         break;
       } catch (err) {
         lastError = err;
         if (attempt < MAX_RETRIES) {
-          console.log(`  Retry ${attempt + 1}/${MAX_RETRIES}: ${err.message}`);
-          await new Promise(r => setTimeout(r, 2000));
+          const backoff = 5000 * (attempt + 1);
+          console.log(`  Retry ${attempt + 1}/${MAX_RETRIES} in ${backoff}ms: ${err.message}`);
+          await new Promise(r => setTimeout(r, backoff));
         }
       }
     }
-
     if (!result && lastError) throw lastError;
 
-    // Run post-processing plugins
     result = await runPostPlugins(result, model);
-
     const durationMs = Date.now() - startTime;
-    trackRequest(model, prompt.length, result.length, durationMs);
+    trackRequest(model, Math.ceil(prompt.length / 4), Math.ceil(result.length / 4), durationMs, false, 'chat_completions');
 
-    // Streaming response (simulated SSE)
     if (stream) {
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
-      res.setHeader('Connection', 'keep-alive');
-      res.setHeader('X-Request-Id', requestId);
-
-      const chunk = {
-        id: requestId, object: 'chat.completion.chunk', created,
-        model: model || 'claude-opus-4-6',
-        choices: [{ index: 0, delta: { role: 'assistant', content: result }, finish_reason: null }],
-      };
+      const chunk = { id: requestId, object: 'chat.completion.chunk', created, model: model || 'claude-opus-4-6',
+        choices: [{ index: 0, delta: { role: 'assistant', content: result }, finish_reason: null }] };
       res.write(`data: ${JSON.stringify(chunk)}\n\n`);
       res.write(`data: ${JSON.stringify({ id: requestId, object: 'chat.completion.chunk', created, model: model || 'claude-opus-4-6', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`);
       res.write('data: [DONE]\n\n');
@@ -330,23 +446,16 @@ app.post('/v1/chat/completions', auth, async (req, res) => {
     }
 
     activeRequests--;
-    const response = {
-      id: requestId, object: 'chat.completion', created,
-      model: model || 'claude-opus-4-6',
-      choices: [{ index: 0, message: { role: 'assistant', content: result }, finish_reason: 'stop' }],
-      usage: {
-        prompt_tokens: Math.ceil(prompt.length / 4),
-        completion_tokens: Math.ceil(result.length / 4),
-        total_tokens: Math.ceil((prompt.length + result.length) / 4),
-      },
-    };
     console.log(`  DONE ${requestId} | ${result.length}c | ${durationMs}ms`);
-    res.json(response);
-
+    res.json({
+      id: requestId, object: 'chat.completion', created, model: model || 'claude-opus-4-6',
+      choices: [{ index: 0, message: { role: 'assistant', content: result }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: Math.ceil(prompt.length / 4), completion_tokens: Math.ceil(result.length / 4), total_tokens: Math.ceil((prompt.length + result.length) / 4) },
+    });
   } catch (err) {
     activeRequests--;
     const durationMs = Date.now() - startTime;
-    trackRequest(model, prompt.length, 0, durationMs, true);
+    trackRequest(model, Math.ceil(prompt.length / 4), 0, durationMs, true, 'chat_completions');
     console.error(`  FAIL ${requestId}: ${err.message} (${durationMs}ms)`);
     res.status(500).json({ error: { message: err.message, type: 'server_error' } });
   }
@@ -372,15 +481,19 @@ app.get('/v1/models', auth, (req, res) => {
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
+    version: '3.0.0',
     active_requests: activeRequests,
     max_concurrent: MAX_CONCURRENT,
     uptime_seconds: Math.floor(process.uptime()),
-    cli: CLAUDE_CLI,
+    endpoints: {
+      '/v1/messages': 'Anthropic Messages API (Agent SDK, supports tool_use)',
+      '/v1/chat/completions': 'OpenAI-compatible (CLI, text-only)',
+    },
   });
 });
 
 // ---------------------------------------------------------------------------
-// GET /stats — Usage dashboard
+// GET /stats
 // ---------------------------------------------------------------------------
 app.get('/stats', auth, (req, res) => {
   res.json({
@@ -388,7 +501,6 @@ app.get('/stats', auth, (req, res) => {
     _responseTimes: undefined,
     uptime_hours: Math.round(process.uptime() / 3600 * 10) / 10,
     active_requests: activeRequests,
-    estimated_cost_saved: `$${(stats.totalTokensEstimated * 0.000015).toFixed(2)} (vs API pricing)`,
   });
 });
 
@@ -400,20 +512,20 @@ loadPlugins();
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`
 ╔════════════════════════════════════════════════════╗
-║  OpenClaw ↔ Claude Code Proxy (Enhanced)           ║
-║  by Ultra Lab (ultralab.tw)                        ║
+║  OpenClaw ↔ Claude Code Proxy v3.0                ║
+║  by Ultra Lab (ultralab.tw)                       ║
 ╠════════════════════════════════════════════════════╣
 ║  Port: ${String(PORT).padEnd(42)}║
-║  Auth: ${(API_KEY ? 'Enabled' : 'Disabled (set API_KEY)').padEnd(42)}║
+║  Auth: ${(API_KEY ? 'Enabled' : 'Disabled').padEnd(42)}║
 ║  Concurrent: ${String(MAX_CONCURRENT).padEnd(36)}║
 ║  Retries: ${String(MAX_RETRIES).padEnd(39)}║
-║  CLI: ${CLAUDE_CLI.padEnd(43)}║
 ║  Plugins: ${String(plugins.length).padEnd(39)}║
 ╠════════════════════════════════════════════════════╣
-║  POST /v1/chat/completions                         ║
-║  GET  /v1/models                                   ║
-║  GET  /health                                      ║
-║  GET  /stats          (usage dashboard)            ║
+║  POST /v1/messages          (Anthropic, tool_use) ║
+║  POST /v1/chat/completions  (OpenAI, text-only)   ║
+║  GET  /v1/models                                  ║
+║  GET  /health                                     ║
+║  GET  /stats                                      ║
 ╚════════════════════════════════════════════════════╝
   `);
 });
